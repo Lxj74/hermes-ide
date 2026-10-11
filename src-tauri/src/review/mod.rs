@@ -212,7 +212,8 @@ pub fn worktree_patch(repo: &Path, base: &str) -> Result<String, String> {
     // hashing anything, so the diff below, which compares the base tree to
     // the worktree itself, writes no objects into the repository and leaves
     // its real index alone. Additions, edits, deletions and renames all
-    // show; ignored files never do.
+    // show; ignored files never do. (Not a copy of the real index: its stat
+    // data can hide a same-size edit made right after a commit.)
     if git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], &[]).is_ok() {
         git(repo, &["read-tree", "HEAD"], &env)?;
     }
@@ -220,6 +221,8 @@ pub fn worktree_patch(repo: &Path, base: &str) -> Result<String, String> {
     git(
         repo,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--no-color",
             "--no-ext-diff",
@@ -235,8 +238,13 @@ pub fn worktree_patch(repo: &Path, base: &str) -> Result<String, String> {
 fn count_lines(hunks: &str) -> (u32, u32) {
     let mut add = 0;
     let mut del = 0;
+    // File headers come before the first hunk; inside one, a "+++"/"---"
+    // line is content (an added "++i;", a removed "---").
+    let mut in_hunk = false;
     for line in hunks.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if !in_hunk && (line.starts_with("+++") || line.starts_with("---")) {
             continue;
         }
         if line.starts_with('+') {
@@ -251,28 +259,36 @@ fn count_lines(hunks: &str) -> (u32, u32) {
 fn unquote_path(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        // git quotes unusual paths in C style; unescape the common cases.
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let mut out = String::new();
-        let mut chars = inner.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some(other) => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                    None => out.push('\\'),
-                }
-            } else {
+        // git quotes unusual paths in C style, non-ASCII bytes as octal
+        // (`caf\303\251.txt`): unescape to bytes, then read them as UTF-8.
+        let inner = &trimmed.as_bytes()[1..trimmed.len() - 1];
+        let mut out = Vec::with_capacity(inner.len());
+        let mut i = 0;
+        while i < inner.len() {
+            let c = inner[i];
+            i += 1;
+            if c != b'\\' || i == inner.len() {
                 out.push(c);
+                continue;
             }
+            let octal = inner.get(i..i + 3).filter(|d| {
+                (b'0'..=b'3').contains(&d[0]) && d[1..].iter().all(|b| (b'0'..=b'7').contains(b))
+            });
+            if let Some(d) = octal {
+                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                i += 3;
+                continue;
+            }
+            match inner[i] {
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                other => out.extend([b'\\', other]),
+            }
+            i += 1;
         }
-        out
+        String::from_utf8_lossy(&out).into_owned()
     } else {
         trimmed.to_string()
     }
@@ -371,8 +387,9 @@ pub fn parse_patch(text: &str) -> Vec<ReviewFile> {
 }
 
 /// The diff the Review Desk shows for a worktree: merge-base to worktree,
-/// untracked files included, the repository's own index untouched.
-#[tauri::command]
+/// untracked files included, the repository's own index untouched. Runs off
+/// the main thread (`async`): on a large repository it takes a while.
+#[tauri::command(async)]
 pub fn review_diff(path: String) -> Result<ReviewDiff, String> {
     let repo = repo_root(&path)?;
     let (base, base_ref, head, branch) = review_base(&repo)?;
@@ -402,7 +419,7 @@ fn write_patch_file(patch: &str) -> Result<(tempfile::TempDir, PathBuf), String>
 
 /// What reverting a turn would do: whether `git apply -R --check` passes,
 /// and the files the patch touches.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn review_revert_preview(path: String, patch: String) -> Result<RevertPreview, String> {
     let repo = repo_root(&path)?;
     let files = parse_patch(&patch);
@@ -440,7 +457,7 @@ pub fn review_revert_preview(path: String, patch: String) -> Result<RevertPrevie
 /// Revert one turn: `git apply -R`, and when the files moved on since,
 /// `git apply -R --3way` (git then merges and stages what it could, leaving
 /// conflict markers where it could not).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn review_revert_patch(path: String, patch: String) -> Result<RevertResult, String> {
     let repo = repo_root(&path)?;
     if parse_patch(&patch).is_empty() {
@@ -852,6 +869,57 @@ diff --git a/tool.bin b/tool.bin\nnew file mode 100644\nindex 0..5\nBinary files
             unquote_path("\"tab\\there\\\\x\\qy\\\""),
             "tab\there\\x\\qy\\"
         );
+    }
+
+    /// A same-size edit right after a commit (an agent changing one
+    /// character) still shows: the private index copy must not make git
+    /// trust the real index's stat data for a file written in its moment.
+    /// Pinned to one instant (file, index entry and index alike) so it does
+    /// not depend on the file system's time resolution.
+    #[test]
+    fn a_same_size_edit_right_after_a_commit_shows() {
+        let (_dir, repo) = fixture();
+        // Rewriting a file moves its ctime; only mtime and size count here.
+        run(&repo, &["config", "core.trustctime", "false"]);
+        let moment = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let pin = |p: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(moment)
+                .unwrap()
+        };
+        let app = repo.join("app.js");
+        fs::write(&app, "const b = 2;\n").unwrap();
+        pin(&app);
+        run(&repo, &["add", "app.js"]);
+        run(&repo, &["commit", "-q", "-m", "app"]);
+        run(&repo, &["branch", "-f", "main", "HEAD"]);
+        fs::write(&app, "const b = 3;\n").unwrap();
+        pin(&app);
+        pin(&repo.join(".git").join("index"));
+        let diff = review_diff(repo.to_string_lossy().to_string()).unwrap();
+        let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["app.js"]);
+    }
+
+    #[test]
+    fn non_ascii_paths_quoted_as_octal_are_decoded() {
+        assert_eq!(unquote_path("\"caf\\303\\251.txt\""), "caf\u{e9}.txt");
+        assert_eq!(unquote_path("\"a\\\\303.txt\""), "a\\303.txt");
+        let (_dir, repo) = fixture();
+        fs::write(repo.join("\u{6570}\u{636e}.txt"), "x\n").unwrap();
+        let diff = review_diff(repo.to_string_lossy().to_string()).unwrap();
+        let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["\u{6570}\u{636e}.txt"]);
+    }
+
+    #[test]
+    fn content_lines_that_look_like_file_headers_are_counted() {
+        let text = "diff --git a/doc.md b/doc.md\nindex 1..2 100644\n--- a/doc.md\n+++ b/doc.md\n@@ -1,4 +1,2 @@\n----\n-title: x\n----\n+++i;\n body\n";
+        let files = parse_patch(text);
+        assert_eq!((files[0].additions, files[0].deletions), (1, 3));
     }
 
     #[test]
