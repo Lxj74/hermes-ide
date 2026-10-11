@@ -36,6 +36,8 @@ const ENGLISH_PACK: LanguagePack = {
   nativeLabel: "English",
   messages: {
     "app.plugins": "Plugins",
+    "app.pluginsUpToDate": "All plugins are up to date",
+    "app.pluginUpdateCheckFailed": "Couldn't check for plugin updates. Check your connection and try again.",
     "app.app": "App",
     "app.settings": "Settings",
     "app.context": "Context",
@@ -1128,6 +1130,7 @@ const ENGLISH_PACK: LanguagePack = {
     "fleet.queueRunning": "{running} of {cap} running",
     "fleet.queueMemory": "{used} of {cap} MB",
     "fleet.queueWaiting": "Starts when a slot frees",
+    "fleet.queueFailed": "Did not start — Start now to try again",
     "fleet.queueStartNow": "Start now",
     "fleet.queueRemove": "Remove",
     "fleet.capOff": "Off",

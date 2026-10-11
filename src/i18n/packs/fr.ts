@@ -6,6 +6,8 @@ export const frPack: LanguagePack = {
   nativeLabel: "Français",
   messages: {
     "app.plugins": "Extensions",
+    "app.pluginsUpToDate": "Toutes les extensions sont à jour",
+    "app.pluginUpdateCheckFailed": "Impossible de vérifier les mises à jour des extensions. Vérifiez votre connexion et réessayez.",
     "app.app": "Application",
     "app.settings": "Paramètres",
     "app.context": "Contexte",
@@ -1098,6 +1100,7 @@ export const frPack: LanguagePack = {
     "fleet.queueRunning": "{running} sur {cap} en cours",
     "fleet.queueMemory": "{used} sur {cap} Mo",
     "fleet.queueWaiting": "Démarre dès qu'une place se libère",
+    "fleet.queueFailed": "N'a pas démarré — « Démarrer maintenant » pour réessayer",
     "fleet.queueStartNow": "Démarrer maintenant",
     "fleet.queueRemove": "Retirer",
     "fleet.capOff": "Désactivé",

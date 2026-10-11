@@ -6,6 +6,8 @@ export const dePack: LanguagePack = {
   nativeLabel: "Deutsch",
   messages: {
     "app.plugins": "Plugins",
+    "app.pluginsUpToDate": "Alle Plugins sind auf dem neuesten Stand",
+    "app.pluginUpdateCheckFailed": "Plugin-Updates konnten nicht geprüft werden. Prüfe deine Verbindung und versuche es erneut.",
     "app.app": "App",
     "app.settings": "Einstellungen",
     "app.context": "Kontext",
@@ -1098,6 +1100,7 @@ export const dePack: LanguagePack = {
     "fleet.queueRunning": "{running} von {cap} laufen",
     "fleet.queueMemory": "{used} von {cap} MB",
     "fleet.queueWaiting": "Startet, sobald ein Platz frei wird",
+    "fleet.queueFailed": "Nicht gestartet – „Jetzt starten“ versucht es erneut",
     "fleet.queueStartNow": "Jetzt starten",
     "fleet.queueRemove": "Entfernen",
     "fleet.capOff": "Aus",

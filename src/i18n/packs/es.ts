@@ -6,6 +6,8 @@ export const esPack: LanguagePack = {
   nativeLabel: "Español",
   messages: {
     "app.plugins": "Plugins",
+    "app.pluginsUpToDate": "Todos los plugins están actualizados",
+    "app.pluginUpdateCheckFailed": "No se pudieron buscar actualizaciones de plugins. Revisa tu conexión e inténtalo de nuevo.",
     "app.app": "Aplicación",
     "app.settings": "Configuración",
     "app.context": "Contexto",
@@ -1098,6 +1100,7 @@ export const esPack: LanguagePack = {
     "fleet.queueRunning": "{running} de {cap} en marcha",
     "fleet.queueMemory": "{used} de {cap} MB",
     "fleet.queueWaiting": "Empieza cuando quede un hueco libre",
+    "fleet.queueFailed": "No se inició: «Iniciar ahora» lo vuelve a intentar",
     "fleet.queueStartNow": "Iniciar ahora",
     "fleet.queueRemove": "Quitar",
     "fleet.capOff": "Desactivado",

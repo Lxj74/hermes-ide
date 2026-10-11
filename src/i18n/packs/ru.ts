@@ -6,6 +6,8 @@ export const ruPack: LanguagePack = {
   nativeLabel: "Русский",
   messages: {
     "app.plugins": "Плагины",
+    "app.pluginsUpToDate": "Все плагины обновлены",
+    "app.pluginUpdateCheckFailed": "Не удалось проверить обновления плагинов. Проверьте подключение и повторите попытку.",
     "app.app": "Приложение",
     "app.settings": "Настройки",
     "app.context": "Контекст",
@@ -1098,6 +1100,7 @@ export const ruPack: LanguagePack = {
     "fleet.queueRunning": "Запущено {running} из {cap}",
     "fleet.queueMemory": "{used} из {cap} МБ",
     "fleet.queueWaiting": "Запустится, когда освободится место",
+    "fleet.queueFailed": "Не запустилась — «Запустить сейчас», чтобы попробовать снова",
     "fleet.queueStartNow": "Запустить сейчас",
     "fleet.queueRemove": "Убрать",
     "fleet.capOff": "Выкл.",

@@ -6,6 +6,8 @@ export const ptBRPack: LanguagePack = {
   nativeLabel: "Português (Brasil)",
   messages: {
     "app.plugins": "Plugins",
+    "app.pluginsUpToDate": "Todos os plugins estão atualizados",
+    "app.pluginUpdateCheckFailed": "Não foi possível verificar atualizações de plugins. Verifique sua conexão e tente novamente.",
     "app.app": "Aplicativo",
     "app.settings": "Configurações",
     "app.context": "Contexto",
@@ -1098,6 +1100,7 @@ export const ptBRPack: LanguagePack = {
     "fleet.queueRunning": "{running} de {cap} em execução",
     "fleet.queueMemory": "{used} de {cap} MB",
     "fleet.queueWaiting": "Começa quando uma vaga liberar",
+    "fleet.queueFailed": "Não iniciou — “Iniciar agora” tenta de novo",
     "fleet.queueStartNow": "Iniciar agora",
     "fleet.queueRemove": "Remover",
     "fleet.capOff": "Desligado",

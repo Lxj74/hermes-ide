@@ -6,6 +6,8 @@ export const zhCNPack: LanguagePack = {
   nativeLabel: "简体中文",
   messages: {
     "app.plugins": "插件",
+    "app.pluginsUpToDate": "所有插件均为最新版本",
+    "app.pluginUpdateCheckFailed": "无法检查插件更新。请检查网络连接后重试。",
     "app.app": "应用",
     "app.settings": "设置",
     "app.context": "上下文",
@@ -1098,6 +1100,7 @@ export const zhCNPack: LanguagePack = {
     "fleet.queueRunning": "{running} / {cap} 正在运行",
     "fleet.queueMemory": "{used} / {cap} MB",
     "fleet.queueWaiting": "有空位时开始",
+    "fleet.queueFailed": "未能启动 — 点击“立即开始”重试",
     "fleet.queueStartNow": "立即开始",
     "fleet.queueRemove": "移除",
     "fleet.capOff": "关闭",

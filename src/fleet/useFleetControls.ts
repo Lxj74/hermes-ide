@@ -18,6 +18,7 @@ import { TURN_LEDGER_EVENT, type TurnLedgerEvent } from "../agent/turns/turnLedg
 import { lastReportedStatus } from "../agent/status/deriveStatus";
 import { raiseInboxItem, resolveInboxItem } from "../agent/contract/inbox";
 import { listAllWorktrees } from "../api/git";
+import { softInterruptAgent } from "../api/agent";
 import type { CreateSessionOpts, SessionData } from "../types/session";
 import type { QueuedLaunch } from "../launcher/launchTask";
 import { getFleetCaps, loadFleetCaps, subscribeFleetCaps, type FleetCaps } from "./fleetSettings";
@@ -29,13 +30,14 @@ import { applyAgentLoad, fetchAgentLoad, getAllLoads, loadPollDelay, subscribeAg
 import {
   enqueueTask,
   hasFreeSlot,
-  listQueuedTasks,
   occupiesSlot,
   publishOccupancy,
   queueEnabled,
   registerTaskStarter,
   removeTask,
+  requeueFailedTask,
   subscribeTaskQueue,
+  waitingTasks,
   type Occupancy,
   type QueuedTask,
 } from "./taskQueue";
@@ -79,6 +81,16 @@ export function computeOccupancy(sessions: readonly SessionData[], now: number):
   return { sessionIds: ids, memoryBytes };
 }
 
+/**
+ * Stop the agent in a session because a cap was reached. An Agent view
+ * session has no terminal to signal: its turn is stopped the way its Stop
+ * button does it.
+ */
+export function interruptForCap(session: Pick<SessionData, "mode"> | undefined, sessionId: string): Promise<boolean> {
+  if (session?.mode === "agent") return softInterruptAgent(sessionId).then(() => true);
+  return invoke<boolean>("interrupt_session_agent", { sessionId });
+}
+
 export function describeTrip(trip: CapTrip, t: Translate): string {
   const vars = { spent: formatUsd(trip.spentUsd), cap: formatUsd(trip.capUsd), name: trip.label };
   return trip.kind === "session" ? t("fleet.capInboxSession", vars) : t("fleet.capInboxFeature", vars);
@@ -87,6 +99,12 @@ export function describeTrip(trip: CapTrip, t: Translate): string {
 export interface FleetControlsOptions {
   /** The `fleetControls` flag: when off, nothing here runs. */
   readonly enabled: boolean;
+  /**
+   * The saved workspace is restored: until then (and until the caps are
+   * read) no task leaves the queue on its own, since the sessions being
+   * restored hold slots the list does not show yet. Default true.
+   */
+  readonly ready?: boolean;
   readonly sessions: readonly SessionData[];
   /** Start a queued task exactly as the New Session wizard (or the ⌘N launcher, `task.launch`) would have. */
   readonly startTask: (opts: CreateSessionOpts, task: QueuedTask) => Promise<{ id: string } | null>;
@@ -100,11 +118,21 @@ export interface FleetControls {
    * True when it was queued.
    */
   readonly queueIfFull: (opts: CreateSessionOpts, label: string, launch?: QueuedLaunch) => boolean;
+  /**
+   * A session started outside the queue (the ⌘N launcher's first agent)
+   * holds its slot before the list shows it: the next agent of the same
+   * launch must see it taken.
+   */
+  readonly noteStarted: (sessionId: string) => void;
 }
 
-export function useFleetControls({ enabled, sessions, startTask, t }: FleetControlsOptions): FleetControls {
+export function useFleetControls({ enabled, ready = true, sessions, startTask, t }: FleetControlsOptions): FleetControls {
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const readyRef = useRef(ready);
+  readyRef.current = ready;
+  // Before the caps are read there is no cap: nothing may start as uncapped.
+  const capsLoadedRef = useRef(false);
   const tRef = useRef(t);
   tRef.current = t;
   const indexRef = useRef<WorktreeIndex>(EMPTY_WORKTREE_INDEX);
@@ -112,12 +140,15 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
   // (in flight, or created but not rendered): each holds a slot.
   const inFlightRef = useRef(0);
   const pendingIdsRef = useRef(new Set<string>());
-  const starting = useCallback(() => {
+  const dropListedPending = useCallback(() => {
     for (const id of [...pendingIdsRef.current]) {
       if (sessionsRef.current.some((s) => s.id === id)) pendingIdsRef.current.delete(id);
     }
-    return inFlightRef.current + pendingIdsRef.current.size;
   }, []);
+  const starting = useCallback(() => {
+    dropListedPending();
+    return inFlightRef.current + pendingIdsRef.current.size;
+  }, [dropListedPending]);
 
   const watcher = useMemo(
     () =>
@@ -125,7 +156,7 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
         sessions: () => sessionsRef.current.filter((s) => !CLOSED_PHASES.has(s.phase)).map((s) => ({ id: s.id, label: s.label })),
         featureOf: (id) => indexRef.current.features.get(id) ?? null,
         caps: getFleetCaps,
-        interrupt: (sessionId) => invoke<boolean>("interrupt_session_agent", { sessionId }),
+        interrupt: (sessionId) => interruptForCap(sessionsRef.current.find((s) => s.id === sessionId), sessionId),
         raise: raiseInboxItem,
         resolve: resolveInboxItem,
         describe: (trip) => describeTrip(trip, tRef.current),
@@ -138,11 +169,16 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     inFlightRef.current++;
     // The new session holds its slot from the moment it exists (see
     // STARTUP_GRACE_MS); until then it is counted as starting.
+    // A start that fails keeps the task (its text, choice and attachments).
     startTask(task.opts, task)
       .then((session) => {
         if (session) pendingIdsRef.current.add(session.id);
+        else requeueFailedTask(task);
       })
-      .catch((err) => console.warn("[fleet] a queued task did not start:", err))
+      .catch((err) => {
+        console.warn("[fleet] a queued task did not start:", err);
+        requeueFailedTask(task);
+      })
       .finally(() => {
         inFlightRef.current--;
       });
@@ -159,8 +195,9 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
       for (;;) {
         const occupancy = computeOccupancy(sessionsRef.current, Date.now());
         publishOccupancy(occupancy);
-        const next = listQueuedTasks()[0];
+        const next = waitingTasks()[0];
         if (!next) return;
+        if (!readyRef.current || !capsLoadedRef.current) return;
         if (queueEnabled(caps) && !hasFreeSlot(occupancy, caps, starting())) return;
         removeTask(next.id);
         launch(next);
@@ -180,7 +217,7 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     if (!enabled || !opts.aiProvider) return false;
     const caps = getFleetCaps();
     if (!queueEnabled(caps)) return false;
-    const waiting = listQueuedTasks().length > 0;
+    const waiting = waitingTasks().length > 0;
     if (!waiting && hasFreeSlot(computeOccupancy(sessionsRef.current, Date.now()), caps, starting())) return false;
     enqueueTask(opts, label, launch);
     return true;
@@ -189,6 +226,7 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
   useEffect(() => {
     if (!enabled) return;
     void loadFleetCaps().then(() => {
+      capsLoadedRef.current = true;
       watcher.check();
       pumpQueue();
     });
@@ -268,10 +306,13 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     };
   }, [enabled, idsKey, watcher, pumpQueue]);
 
-  // Session phases and startup states change without an event.
+  // Session phases and startup states change without an event. A pending
+  // id is dropped as soon as the list shows it, even with nothing waiting:
+  // a session closed before the next queue check must not hold a slot.
   useEffect(() => {
+    dropListedPending();
     if (enabled) pumpQueue();
-  }, [enabled, sessions, pumpQueue]);
+  }, [enabled, ready, sessions, pumpQueue, dropListedPending]);
 
   // ── N22: the agents' load, polled while a cap is set (every second
   // while tasks wait, every few seconds otherwise) ─────────────────────
@@ -282,7 +323,7 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     let polling = false;
     let stopped = false;
     const schedule = () => {
-      const delay = loadPollDelay(listQueuedTasks().length);
+      const delay = loadPollDelay(waitingTasks().length);
       timerDue = Date.now() + delay;
       timer = setTimeout(tick, delay);
     };
@@ -302,7 +343,7 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     };
     // A task that starts waiting brings the next read forward.
     const offQueue = subscribeTaskQueue(() => {
-      if (stopped || polling || !timer || timerDue - Date.now() <= loadPollDelay(listQueuedTasks().length)) return;
+      if (stopped || polling || !timer || timerDue - Date.now() <= loadPollDelay(waitingTasks().length)) return;
       clearTimeout(timer);
       schedule();
     });
@@ -314,5 +355,10 @@ export function useFleetControls({ enabled, sessions, startTask, t }: FleetContr
     };
   }, [enabled]);
 
-  return useMemo(() => ({ queueIfFull }), [queueIfFull]);
+  const noteStarted = useCallback((sessionId: string) => {
+    // Already listed: the list counts it.
+    if (!sessionsRef.current.some((s) => s.id === sessionId)) pendingIdsRef.current.add(sessionId);
+  }, []);
+
+  return useMemo(() => ({ queueIfFull, noteStarted }), [queueIfFull, noteStarted]);
 }

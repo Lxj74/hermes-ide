@@ -6,6 +6,8 @@ export const jaPack: LanguagePack = {
   nativeLabel: "日本語",
   messages: {
     "app.plugins": "プラグイン",
+    "app.pluginsUpToDate": "すべてのプラグインは最新です",
+    "app.pluginUpdateCheckFailed": "プラグインの更新を確認できませんでした。接続を確認して、もう一度お試しください。",
     "app.app": "アプリ",
     "app.settings": "設定",
     "app.context": "コンテキスト",
@@ -1098,6 +1100,7 @@ export const jaPack: LanguagePack = {
     "fleet.queueRunning": "{cap} 中 {running} 実行中",
     "fleet.queueMemory": "{cap} MB 中 {used}",
     "fleet.queueWaiting": "空きが出たら開始します",
+    "fleet.queueFailed": "開始できませんでした — 「今すぐ開始」で再試行",
     "fleet.queueStartNow": "今すぐ開始",
     "fleet.queueRemove": "削除",
     "fleet.capOff": "オフ",
