@@ -1,6 +1,14 @@
-# Hermes IDE 2.2.8
+# Hermes IDE 2.2.9
 
-This release fixes problems that build up when Hermes stays open for days or weeks.
+This release adds New folder… for starting a project from scratch, and fixes problems that build up when Hermes stays open for days or weeks (2.2.8 was never published; its fixes are here).
+
+## New
+
+- Start a project from scratch: New folder… in ⌘N and in the New Session wizard creates a new project folder, like an IDE's New Project. Give it a name and a location, and choose whether it starts with a git repository, a .gitignore, an AGENTS.md for agent instructions (which Claude Code also reads) and a README. The folder is added to the session at once, and the agent starts in it.
+
+## Improved
+
+- The sidebar button that groups sessions is now called "New group", so it is no longer confused with creating a project.
 
 ## Fixes
 
