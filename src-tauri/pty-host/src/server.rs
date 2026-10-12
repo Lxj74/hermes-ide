@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Config {
@@ -52,9 +52,10 @@ struct HostSession {
     id: String,
     pid: u32,
     master: Box<dyn MasterPty + Send>,
-    /// Locked on its own: a write blocks while the program leaves its input
-    /// unread, and output must keep flowing meanwhile.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Feeds the session's input thread. A PTY write blocks while the
+    /// program leaves its input unread; on its own thread it holds up
+    /// neither output nor the client's resize and kill requests.
+    input: mpsc::Sender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     ring: Ring,
     client: Option<Out>,
@@ -238,14 +239,19 @@ fn janitor(sessions: Sessions, cfg: Arc<Config>, started: Instant) {
             std::thread::sleep(Duration::from_millis(250));
             let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
             map.retain(|id, sess| {
-                let s = sess.lock().unwrap_or_else(|e| e.into_inner());
+                let mut s = sess.lock().unwrap_or_else(|e| e.into_inner());
                 // A session ended on request is forgotten at once: nobody
                 // needs to be told it ended (Hermes stops idle terminals
                 // this way when it quits, then starts new ones on restore).
-                let gone = s.exited
+                // Its program having ended is enough: on Linux a leftover
+                // background job (`cmd & disown`, `ssh -fN`) can keep the
+                // terminal open, so its output never ends, and the host
+                // would never empty out and exit.
+                let gone = (s.exited
                     && (s.exit_delivered
                         || s.kill_requested
-                        || s.exited_at.is_some_and(|t| t.elapsed() >= cfg.exited_keep));
+                        || s.exited_at.is_some_and(|t| t.elapsed() >= cfg.exited_keep)))
+                    || (s.kill_requested && matches!(s.child.try_wait(), Ok(Some(_))));
                 if gone {
                     log(&format!("forgot ended session {id}"));
                 }
@@ -339,15 +345,9 @@ fn serve(
         match frame {
             Frame::Data(bytes) => {
                 if let Some(sess) = &attached {
-                    let target = {
-                        let s = sess.lock().unwrap_or_else(|e| e.into_inner());
-                        (!s.exited).then(|| (s.id.clone(), Arc::clone(&s.writer)))
-                    };
-                    if let Some((id, writer)) = target {
-                        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Err(e) = w.write_all(&bytes).and_then(|_| w.flush()) {
-                            log(&format!("input to {id} failed: {e}"));
-                        }
+                    let s = sess.lock().unwrap_or_else(|e| e.into_inner());
+                    if !s.exited {
+                        let _ = s.input.send(bytes);
                     }
                 }
             }
@@ -561,7 +561,7 @@ fn spawn_session(
         id: id.clone(),
         pid,
         master: pair.master,
-        writer: Arc::new(Mutex::new(writer)),
+        input: input_thread(id.clone(), writer),
         child,
         ring: Ring::new(cfg.ring_bytes),
         client: None,
@@ -580,6 +580,21 @@ fn spawn_session(
     log(&format!("spawned {id}: pid {pid}, {}", argv.join(" ")));
     read_loop(session, reader);
     Ok((id, pid))
+}
+
+/// Writes a session's input to its PTY in the order it came, until the
+/// session is forgotten (its sender with it). The queue is unbounded, like
+/// the app's own input queue: handing input over must never wait.
+fn input_thread(id: String, mut writer: Box<dyn Write + Send>) -> mpsc::Sender<Vec<u8>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        for bytes in rx {
+            if let Err(e) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                log(&format!("input to {id} failed: {e}"));
+            }
+        }
+    });
+    tx
 }
 
 /// Forwards a session's output into its ring and to its attached client,

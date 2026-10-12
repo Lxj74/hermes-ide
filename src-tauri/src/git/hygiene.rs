@@ -48,6 +48,8 @@ pub const SETTING_LOW_DISK_GB: &str = "worktree_low_disk_gb";
 pub const BACKUP_LOG: &str = "worktree-backups.jsonl";
 /// Namespace of backup refs in the repo itself.
 pub const BACKUP_REF_PREFIX: &str = "refs/hermes/backups/";
+/// How long a backup is kept before the automatic pass deletes it.
+pub const BACKUP_KEEP_DAYS: i64 = 90;
 
 /// How many worktrees are measured at once.
 const SCAN_WORKERS: usize = 4;
@@ -339,6 +341,35 @@ fn admin_dir(path: &Path) -> Option<PathBuf> {
     run(git_at(path).args(["rev-parse", "--absolute-git-dir"])).map(PathBuf::from)
 }
 
+// ─── Kept by the person ─────────────────────────────────────────────
+
+/// Marks a worktree the person chose to keep on close. It sits in git's
+/// private folder for the worktree, so `git status` never sees it, and it
+/// goes when the worktree does.
+const KEPT_MARKER: &str = "hermes-kept";
+
+/// git's private folder for the worktree at `path`, from its `.git` file
+/// (no git process: this runs for every folder of every scan).
+fn admin_dir_from_git_file(path: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(path.join(".git")).ok()?;
+    let dir = text.trim().strip_prefix("gitdir:")?.trim();
+    Some(path.join(dir))
+}
+
+/// Record that the person keeps the worktree at `path`: no automatic
+/// cleanup removes it from now on.
+pub fn mark_kept(path: &Path) -> Result<(), String> {
+    let admin = admin_dir_from_git_file(path)
+        .filter(|d| d.is_dir())
+        .ok_or_else(|| format!("{} is not a git worktree", path.display()))?;
+    fs::write(admin.join(KEPT_MARKER), b"").map_err(|e| e.to_string())
+}
+
+/// The person chose to keep this worktree; only they may remove it.
+pub fn is_kept(path: &Path) -> bool {
+    admin_dir_from_git_file(path).is_some_and(|d| d.join(KEPT_MARKER).is_file())
+}
+
 // ─── Last used ──────────────────────────────────────────────────────
 
 /// A time from the database: SQLite's `YYYY-MM-DD HH:MM:SS` (UTC) or RFC 3339.
@@ -594,7 +625,7 @@ pub fn inspect(
             .sum()
     };
     let total_bytes = allocated_size(path);
-    let decision = decide(PolicyInput {
+    let mut decision = decide(PolicyInput {
         open,
         linked: !links.is_empty(),
         idle: is_idle(used, now, settings.idle_days),
@@ -602,6 +633,9 @@ pub fn inspect(
         facts: &facts,
         build_output_bytes,
     });
+    if is_kept(path) {
+        decision.auto_action = AutoAction::None;
+    }
     let auto_bytes = match decision.auto_action {
         AutoAction::None => 0,
         AutoAction::RemoveBuildOutput => build_output_bytes,
@@ -885,6 +919,54 @@ pub fn list_backups(app_data: &Path, limit: usize) -> Vec<BackupRecord> {
     out
 }
 
+/// Delete the backups made before `cutoff`: the ref in its repo, then the
+/// line in the backup log. One whose ref could not be deleted stays listed
+/// for a later pass; one whose repo is gone only leaves the log.
+pub fn expire_backups(app_data: &Path, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
+    let log = app_data.join(BACKUP_LOG);
+    let Ok(text) = fs::read_to_string(&log) else {
+        return 0;
+    };
+    let mut kept = String::new();
+    let mut expired = 0;
+    for line in text.lines() {
+        let old = serde_json::from_str::<BackupRecord>(line).ok().filter(|r| {
+            chrono::DateTime::parse_from_rfc3339(&r.created_at).is_ok_and(|t| t < cutoff)
+        });
+        if old.is_some_and(|r| delete_backup_ref(&r)) {
+            expired += 1;
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if expired > 0 {
+        let tmp = log.with_extension("jsonl.tmp");
+        if fs::write(&tmp, kept)
+            .and_then(|_| fs::rename(&tmp, &log))
+            .is_err()
+        {
+            let _ = fs::remove_file(&tmp);
+            return 0;
+        }
+    }
+    expired
+}
+
+/// True when the backup's ref is gone from its repo (deleted now, or
+/// already). Only the commit the backup recorded is deleted.
+fn delete_backup_ref(r: &BackupRecord) -> bool {
+    let repo = Path::new(&r.repo_path);
+    if !repo.is_dir() {
+        return true;
+    }
+    let deleted = git_at(repo)
+        .args(["update-ref", "-d", &r.ref_name, &r.commit])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    deleted || run(git_at(repo).args(["rev-parse", "--verify", "-q", &r.ref_name])).is_none()
+}
+
 // ─── Removal ────────────────────────────────────────────────────────
 
 /// Who asked for a removal.
@@ -950,6 +1032,10 @@ pub fn remove_worktree_safely(
         }
         return outcome;
     };
+    if requester == Requester::Automatic && is_kept(path) {
+        outcome.error = Some("You chose to keep it; left for you to decide".into());
+        return outcome;
+    }
     let facts = work_facts(repo, path);
     if requester == Requester::Automatic {
         let d = decide(PolicyInput {
@@ -1016,6 +1102,13 @@ pub fn remove_worktree_safely(
 /// nothing in it can be lost (clean, no commits that exist only there).
 /// Anything else stays for the Storage view. True when removed.
 pub fn remove_orphan_if_nothing_to_lose(app_data: &Path, repo: &Path, path: &Path) -> bool {
+    if is_kept(path) {
+        log::info!(
+            "[hygiene] keeping worktree '{}': the person chose to keep it",
+            path.display()
+        );
+        return false;
+    }
     let facts = work_facts(repo, path);
     if !facts.git_knows || facts.has_work() {
         log::info!(
@@ -1445,6 +1538,37 @@ mod tests {
     }
 
     #[test]
+    fn backups_older_than_the_cutoff_are_deleted_with_their_refs() {
+        let l = layout();
+        let mut made = Vec::new();
+        for name in ["a_old", "a_new"] {
+            let wt = add_worktree(&l, name, &name[2..]);
+            fs::write(wt.join("untracked.txt"), "new").unwrap();
+            made.push(snapshot_backup(&l.app_data, &l.repo, &wt, true, Some(&name[2..])).unwrap());
+        }
+        // The first backup is a year old; a line that does not parse stays.
+        let log = l.app_data.join(BACKUP_LOG);
+        let text = fs::read_to_string(&log).unwrap();
+        let aged = text.replacen(&made[0].created_at, "2025-01-01T00:00:00+00:00", 1);
+        fs::write(&log, format!("{aged}not json\n")).unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(BACKUP_KEEP_DAYS);
+
+        assert_eq!(expire_backups(&l.app_data, cutoff), 1);
+        let refs = git(
+            &l.repo,
+            &["for-each-ref", "--format=%(refname)", BACKUP_REF_PREFIX],
+        );
+        assert_eq!(refs, made[1].ref_name);
+        assert_eq!(list_backups(&l.app_data, 10), vec![made[1].clone()]);
+        assert!(fs::read_to_string(&log).unwrap().contains("not json"));
+        assert_eq!(
+            expire_backups(&l.app_data, cutoff),
+            0,
+            "nothing left to expire"
+        );
+    }
+
+    #[test]
     fn folder_git_no_longer_knows_is_backed_up_then_removed() {
         let l = layout();
         let wt = add_worktree(&l, "a_lost", "lost");
@@ -1582,6 +1706,57 @@ mod tests {
             &dirty
         ));
         assert!(dirty.join("x.txt").exists());
+    }
+
+    #[test]
+    fn a_kept_worktree_is_never_removed_automatically_even_when_clean() {
+        let l = layout();
+        let kept = add_worktree(&l, "a_kept", "kept");
+        fs::write(kept.join(".env"), "SECRET=1").unwrap(); // ignored, so "clean"
+        mark_kept(&kept).unwrap();
+        assert!(is_kept(&kept));
+        assert!(git(&kept, &["status", "--porcelain"]).is_empty());
+        assert!(!remove_orphan_if_nothing_to_lose(
+            &l.app_data,
+            &l.repo,
+            &kept
+        ));
+        let out = remove_worktree_safely(
+            &l.app_data,
+            &l.base,
+            Some(&l.repo),
+            &kept,
+            false,
+            Requester::Automatic,
+        );
+        assert!(!out.removed, "{out:?}");
+        let settings = HygieneSettings {
+            idle_days: 0,
+            ..Default::default()
+        };
+        let entries = scan(
+            &l.base,
+            &[],
+            &HashSet::new(),
+            &settings,
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        assert_eq!(entries[0].decision.state, LifeState::Orphaned);
+        assert_eq!(entries[0].decision.auto_action, AutoAction::None);
+        assert_eq!(entries[0].auto_bytes, 0);
+        assert!(kept.join(".env").exists());
+        // The person can still remove it.
+        let out = remove_worktree_safely(
+            &l.app_data,
+            &l.base,
+            Some(&l.repo),
+            &kept,
+            false,
+            Requester::Person {
+                allow_unrecoverable: false,
+            },
+        );
+        assert!(out.removed, "{out:?}");
     }
 
     #[test]

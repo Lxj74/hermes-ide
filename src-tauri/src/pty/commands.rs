@@ -57,6 +57,10 @@ fn ssh_command(
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
+    // A master this command starts must notice a dead link (sleep, network
+    // change) quickly, or every later client waits on it.
+    cmd.arg("-o").arg("ServerAliveInterval=5");
+    cmd.arg("-o").arg("ServerAliveCountMax=2");
     // Reuse existing TCP connection if available, or establish a new persistent one
     let socket_path = ssh_socket_path(user, host, port);
     cmd.arg("-o")
@@ -135,6 +139,44 @@ fn ssh_exec(
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run ssh: {}", e))?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    ))
+}
+
+/// How long a background ssh query (remote cwd, git info, tmux windows) may
+/// take before it is abandoned and its ssh process killed.
+const SSH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `ssh_exec` for the periodic queries: runs off the window's thread and kills
+/// ssh when it takes longer than `timeout` (a stuck link must not pile up).
+async fn ssh_exec_async(
+    user: &str,
+    host: &str,
+    port: u16,
+    jump_host: Option<&str>,
+    remote_cmd: &str,
+    timeout: std::time::Duration,
+) -> Result<(String, String, bool), String> {
+    let mut cmd = ssh_command(user, host, port, jump_host);
+    cmd.arg(remote_cmd);
+    output_with_timeout(cmd, timeout)
+        .await
+        .map_err(|e| format!("Failed to run ssh: {}", e))
+}
+
+async fn output_with_timeout(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<(String, String, bool), String> {
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| format!("timed out after {} s", timeout.as_secs_f32()))?
+        .map_err(|e| e.to_string())?;
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -563,8 +605,15 @@ pub async fn ssh_list_tmux_windows(
         "tmux list-windows -t '{}' -F '#{{window_index}}|||#{{window_name}}|||#{{window_active}}'",
         tmux_session.replace('\'', "'\\''")
     );
-    let (stdout, stderr, success) =
-        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
+    let (stdout, stderr, success) = ssh_exec_async(
+        &user,
+        &host,
+        port,
+        jump_host.as_deref(),
+        &remote_cmd,
+        SSH_QUERY_TIMEOUT,
+    )
+    .await?;
 
     if !success {
         return Err(format!("Failed to list tmux windows: {}", stderr.trim()));
@@ -3012,23 +3061,13 @@ pub fn close_session(
         // pin cleanup + worktree removal used to live in this block — for
         // Bug 1 (1.2.x) those moved into the mode-agnostic section below
         // so agent sessions get the same treatment.
-        if let Ok(analyzer) = pty_session.analyzer.lock() {
+        if let Ok(mut analyzer) = pty_session.analyzer.lock() {
             let snapshot = analyzer.get_stripped_output();
             let metrics = analyzer.to_metrics();
             if let Ok(db) = state.db.lock() {
                 db.save_session_snapshot(&session_id, &snapshot).ok();
                 // Persist final token state
-                for (provider, tokens) in &metrics.token_usage {
-                    db.record_token_usage(
-                        &session_id,
-                        provider,
-                        &tokens.model,
-                        tokens.input_tokens as i64,
-                        tokens.output_tokens as i64,
-                        tokens.estimated_cost_usd,
-                    )
-                    .ok();
-                }
+                save_token_usage(&db, &session_id, &mut analyzer).ok();
                 // Persist memory facts
                 for fact in &metrics.memory_facts {
                     db.save_memory_entry(
@@ -3061,6 +3100,8 @@ pub fn close_session(
     let _ = app.emit("session-removed", &session_id);
     crate::project::attunement::delete_session_context_file(&app, &session_id);
     crate::pty::launch::remove_session_files(&app, &session_id);
+    crate::transcript::cleanup_session_watchers(&app, &session_id);
+    crate::project::attunement::delete_agent_state_folder(&session_id);
     if let Some(checks) = tauri::Manager::try_state::<crate::done_when::DoneWhenState>(&app) {
         checks.forget(&session_id);
     }
@@ -3138,26 +3179,36 @@ pub fn save_all_snapshots(state: State<'_, AppState>) -> Result<(), String> {
         }
 
         // Save snapshot AFTER metadata to avoid INSERT OR REPLACE wiping it
-        if let Ok(analyzer) = pty_session.analyzer.lock() {
+        if let Ok(mut analyzer) = pty_session.analyzer.lock() {
             let snapshot = analyzer.get_stripped_output();
             db.save_session_snapshot(session_id, &snapshot).ok();
 
             // Persist token usage
-            let metrics = analyzer.to_metrics();
-            for (provider, tokens) in &metrics.token_usage {
-                db.record_token_usage(
-                    session_id,
-                    provider,
-                    &tokens.model,
-                    tokens.input_tokens as i64,
-                    tokens.output_tokens as i64,
-                    tokens.estimated_cost_usd,
-                )
-                .ok();
-            }
+            save_token_usage(&db, session_id, &mut analyzer).ok();
         }
     }
 
+    Ok(())
+}
+
+/// Writes the token usage a session gained since its last save. This runs
+/// on every workspace save, so it must add only the growth.
+pub(crate) fn save_token_usage(
+    db: &Database,
+    session_id: &str,
+    analyzer: &mut OutputAnalyzer,
+) -> Result<(), String> {
+    for unsaved in analyzer.unsaved_token_usage() {
+        db.record_token_usage(
+            session_id,
+            &unsaved.provider,
+            &unsaved.model,
+            unsaved.input_tokens as i64,
+            unsaved.output_tokens as i64,
+            unsaved.cost_usd,
+        )?;
+        analyzer.mark_tokens_saved(&unsaved);
+    }
     Ok(())
 }
 
@@ -4184,7 +4235,7 @@ pub fn ssh_list_port_forwards(
 // ─── Remote CWD & Git Info Commands ──────────────────────────────────
 
 #[tauri::command]
-pub fn ssh_get_remote_cwd(
+pub async fn ssh_get_remote_cwd(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<String, String> {
@@ -4199,13 +4250,15 @@ pub fn ssh_get_remote_cwd(
         "pwd".to_string()
     };
 
-    let (stdout, stderr, success) = ssh_exec(
+    let (stdout, stderr, success) = ssh_exec_async(
         &info.user,
         &info.host,
         info.port,
         info.jump_host.as_deref(),
         &remote_cmd,
-    )?;
+        SSH_QUERY_TIMEOUT,
+    )
+    .await?;
     if !success {
         return Err(format!("Failed to get remote CWD: {}", stderr.trim()));
     }
@@ -4213,7 +4266,7 @@ pub fn ssh_get_remote_cwd(
 }
 
 #[tauri::command]
-pub fn ssh_get_remote_git_info(
+pub async fn ssh_get_remote_git_info(
     state: State<'_, AppState>,
     session_id: String,
     remote_path: String,
@@ -4226,13 +4279,15 @@ pub fn ssh_get_remote_git_info(
         remote_path.replace('\'', "'\\''")
     );
 
-    let (stdout, _stderr, _success) = ssh_exec(
+    let (stdout, _stderr, _success) = ssh_exec_async(
         &info.user,
         &info.host,
         info.port,
         info.jump_host.as_deref(),
         &remote_cmd,
-    )?;
+        SSH_QUERY_TIMEOUT,
+    )
+    .await?;
     let lines: Vec<&str> = stdout.lines().collect();
 
     let branch = lines.first().and_then(|l| {
@@ -5782,5 +5837,32 @@ mod foreground_tests {
         let _ = lone.kill();
         let _ = lone.wait();
         assert!(!found, "found a child that does not exist");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ssh_query_timeout_tests {
+    use super::output_with_timeout;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn a_query_that_hangs_is_abandoned_at_the_timeout() {
+        // A dead link used to hold the poll (and the window) until ssh gave up.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = Instant::now();
+        let result = output_with_timeout(cmd, Duration::from_millis(200)).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_quick_query_returns_its_output() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("echo out; echo err >&2");
+        let (stdout, stderr, ok) = output_with_timeout(cmd, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!((stdout.trim(), stderr.trim(), ok), ("out", "err", true));
     }
 }
