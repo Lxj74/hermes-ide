@@ -1,18 +1,21 @@
 import "../styles/components/TaskLauncher.css";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { homeDir } from "@tauri-apps/api/path";
 import { useI18n } from "../i18n/I18nProvider";
 import { Button, Checkbox, Chip, CloseButton, IconButton, Input, Segmented, Select, Textarea, type SelectOption } from "./ui";
 import { NewFolderForm } from "./NewFolderForm";
+import { LauncherProjectMenu, type LauncherExtras } from "./LauncherProjectMenu";
 import type { ControlAttrs } from "./ui/attrs";
 import { cx } from "./ui/Button";
 import { CloseGlyph } from "./ui/icons";
 import { customAgent, getAgent, installCommand, listAgents } from "../catalog/agentCatalog";
 import { getSetting, setSetting } from "../api/settings";
 import { getDiskStatus } from "../api/git";
-import { getProjectsOrdered } from "../api/projects";
+import { deleteProject, getProjectsOrdered } from "../api/projects";
 import { probeTaskRepo, type RepoProbe } from "../api/launcher";
 import type { DiskStatus } from "../types/git";
+import type { ProjectOrdered } from "../types/project";
 import type { SessionMode } from "../types/session";
 import type { AgentCapabilities, CheckedPreset, ChoiceIssue, LaunchChoice } from "../agent/capabilities/types";
 import { reconcileChoice } from "../agent/capabilities/choice";
@@ -63,6 +66,7 @@ import { LaunchAttachments, useFileDrop, useLaunchAttachmentInput } from "./Laun
 import { FILE_DROP_TARGET } from "../utils/fileDropTarget";
 import { attachmentFromPath, type LaunchAttachment } from "../launcher/attachments";
 import { useModalTabTrap } from "../hooks/useFocusTrap";
+import { extraBlock, takesExtraFolders, type ExtraBlock, type FolderRef } from "../launcher/extraFolders";
 import { queuedNewBranches, useTaskQueue } from "../fleet/taskQueue";
 import {
   TASK_LAUNCHES_KEY,
@@ -108,6 +112,11 @@ export interface TaskLaunchRequest {
   task: string;
   /** The repository's main checkout. */
   repoRoot: string;
+  /**
+   * More folders the task works in, edited in place on whatever branch
+   * they are on (only the main project gets the task's branch and worktree).
+   */
+  extraRoots?: string[];
   /** The first entry is the main agent; a second one runs the same task on its own branch. */
   agents: PlannedAgent[];
   track: TaskTrack;
@@ -194,6 +203,13 @@ function baseName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** The project a launcher without an active session starts on: the most used one whose folder is there. */
+function startProject(list: ProjectOrdered[]): ProjectOrdered | undefined {
+  let best: ProjectOrdered | undefined;
+  for (const p of list) if (p.path_exists !== false && (!best || (p.session_count ?? 0) > (best.session_count ?? 0))) best = p;
+  return best;
+}
+
 /**
  * Arrow keys move the focus between the buttons of an open menu. A control
  * that takes the arrow keys itself (a field, a Select, a segmented control)
@@ -276,6 +292,9 @@ export function TaskLauncher({
   const [choice, setChoice] = useState<LaunchChoice | null>(null);
   const [repoPath, setRepoPath] = useState(defaultRepo ?? "");
   const [probe, setProbe] = useState<{ path: string; result: RepoProbe } | null>(null);
+  // More folders the task works in (edited in place), and what was read about each.
+  const [extraRoots, setExtraRoots] = useState<string[]>([]);
+  const [extraProbes, setExtraProbes] = useState<Record<string, RepoProbe>>({});
   const [branch, setBranch] = useState("");
   const [branchEdited, setBranchEditedState] = useState(false);
   // Also read by the branch effect, which can run in the same flush as a
@@ -327,7 +346,10 @@ export function TaskLauncher({
   const [suggestCount, setSuggestCount] = useState(0);
   const [suggestName, setSuggestName] = useState("");
   const [saving, setSaving] = useState<string | null>(null);
-  const [projects, setProjects] = useState<{ path: string; name: string }[]>([]);
+  const [projects, setProjects] = useState<ProjectOrdered[]>([]);
+  const [projectsFailed, setProjectsFailed] = useState(false);
+  const [projectsAttempt, setProjectsAttempt] = useState(0);
+  const [home, setHome] = useState<string | null>(null);
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [recents, setRecents] = useState<string[]>([]);
   const [prefixes, setPrefixes] = useState<Record<string, string>>({});
@@ -482,29 +504,41 @@ export function TaskLauncher({
     [backend],
   );
 
-  // Projects, most used first (every launch is a session of its project).
+  // Projects, most used first (every launch is a session of its project);
+  // the menu shows missing folders too, the starting one is never one of them.
   useEffect(() => {
     let cancelled = false;
     getProjectsOrdered()
-      .catch(() => [])
-      .then((list) => {
-        if (cancelled) return;
-        const sorted = list
-          .filter((p) => p.path_exists !== false)
-          .map((p, i) => ({ path: p.path, name: p.name || baseName(p.path), i, s: p.session_count ?? 0 }))
-          .sort((a, b) => b.s - a.s || a.i - b.i);
-        setProjects(sorted.map(({ path, name }) => ({ path, name })));
-        if (!repoPathRef.current.trim() && sorted[0]) {
-          repoPathRef.current = sorted[0].path;
-          setRepoPath(sorted[0].path);
-        }
-        setProjectsLoaded(true);
-      })
+      .then(
+        (list) => {
+          if (cancelled) return;
+          const named = list.map((p) => ({ ...p, name: p.name || baseName(p.path) }));
+          setProjects(named);
+          setProjectsFailed(false);
+          const start = startProject(named);
+          if (!repoPathRef.current.trim() && start) {
+            repoPathRef.current = start.path;
+            setRepoPath(start.path);
+          }
+          setProjectsLoaded(true);
+        },
+        () => {
+          if (cancelled) return;
+          setProjectsFailed(true);
+          setProjectsLoaded(true);
+        },
+      )
       .catch(() => setProjectsLoaded(true));
     return () => {
       cancelled = true;
     };
-  }, [backend]);
+  }, [backend, projectsAttempt]);
+  useEffect(() => {
+    homeDir().then(
+      (h) => setHome(h.replace(/[\\/]+$/, "")),
+      () => setHome(null),
+    );
+  }, []);
   const repoPathRef = useRef(repoPath);
   repoPathRef.current = repoPath;
 
@@ -532,6 +566,7 @@ export function TaskLauncher({
       setChecksEdited(draft.checksEdited);
       setExpanded(draft.expanded);
       if (draft.attachments) setAttachments(draft.attachments);
+      if (draft.extraRoots) setExtraRoots(draft.extraRoots);
       if (draft.viewMode) viewFromDraft.current = { agentId: draft.choice.agentId, mode: draft.viewMode };
       // The draft's choice is the person's own: a project switch only offers that project's usual.
       userTouched.current = true;
@@ -891,6 +926,86 @@ export function TaskLauncher({
     return list;
   }, [effective, branch, viewMode, capsOf, where, task, backend, fallbackId, plainFolder, takenBranches]);
 
+  // ── extra folders ───────────────────────────────────────────────
+  // Only an agent that can be given more folders gets them (Claude's
+  // --add-dir); for any other the checkboxes are hidden and nothing is sent.
+  const extrasOk = !!choice && takesExtraFolders(choice.agentId, hasAgentView(choice.agentId) ? viewMode : "terminal");
+  const activeExtras = useMemo(() => (extrasOk ? extraRoots : []), [extrasOk, extraRoots]);
+  const projectName = useCallback((path: string) => projects.find((p) => samePath(p.path, path))?.name || baseName(path), [projects]);
+  const mainRef = useMemo((): FolderRef | null => (repoPath.trim() ? { path: probed?.resolved || repoPath.trim(), name: projectName(repoPath), gitRoot } : null), [repoPath, probed, gitRoot, projectName]);
+  const refOf = useCallback((path: string): FolderRef => ({ path, name: projectName(path), gitRoot: extraProbes[path]?.git_root }), [projectName, extraProbes]);
+  const blockText = (b: ExtraBlock): string =>
+    b.kind === "missing"
+      ? t("launcher.projectMissing")
+      : b.kind === "cap"
+        ? t("launcher.extraCap", { max: b.max })
+        : t(b.kind === "inside" ? "launcher.extraInside" : b.kind === "contains" ? "launcher.extraContains" : "launcher.extraSameRepo", { name: b.name });
+  /** "⎇ dev ●3", "not git": an extra folder's branch and uncommitted changes, once read. */
+  const extraDetail = (path: string): string | undefined => {
+    const p = extraProbes[path];
+    if (!p) return undefined;
+    if (!p.git_root) return t("launcher.extraNotGit");
+    const dirty = p.dirty_count ?? 0;
+    return `⎇ ${p.current_branch || "HEAD"}${dirty > 0 ? ` ●${dirty}` : ""}`;
+  };
+  /** Adds a folder to the task's extra ones (read first: its repository decides), or takes it out. */
+  const toggleExtra = async (path: string) => {
+    userTouched.current = true;
+    if (extraRoots.some((p) => samePath(p, path))) {
+      setExtraRoots((cur) => cur.filter((p) => !samePath(p, path)));
+      return;
+    }
+    const exists = projects.find((p) => samePath(p.path, path))?.path_exists !== false;
+    const check = (extras: string[], probes: Record<string, RepoProbe>) =>
+      extraBlock(
+        { path, name: projectName(path), gitRoot: probes[path]?.git_root, exists },
+        { main: mainRef, extras: extras.map((p) => ({ path: p, name: projectName(p), gitRoot: probes[p]?.git_root })), windows: PLATFORM === "win" },
+      );
+    if (check(extraRoots, extraProbes)) return;
+    let read = extraProbes[path];
+    if (!read) {
+      read = await probeTaskRepo(path, undefined, true).catch(
+        (): RepoProbe => ({ git_root: null, branch_exists: false, local_branches: [], worktree_toml: null, current_branch: null, dirty_count: null }),
+      );
+      const probes = { ...extraProbes, [path]: read };
+      setExtraProbes((cur) => ({ ...cur, [path]: read }));
+      // A worktree of the main project's repository (or of another extra one's): not added, and its row says why.
+      setExtraRoots((cur) => (cur.some((p) => samePath(p, path)) || check(cur, probes) ? cur : [...cur, path]));
+      return;
+    }
+    setExtraRoots((cur) => (cur.some((p) => samePath(p, path)) ? cur : [...cur, path]));
+  };
+  // An extra folder that came back with a draft is read once too (its branch, its changes, its repository).
+  const extraReading = useRef(new Set<string>());
+  useEffect(() => {
+    for (const path of extraRoots) {
+      if (extraProbes[path] || extraReading.current.has(path)) continue;
+      extraReading.current.add(path);
+      probeTaskRepo(path, undefined, true)
+        .then((r) => setExtraProbes((cur) => ({ ...cur, [path]: r })))
+        .catch(() => {})
+        .finally(() => extraReading.current.delete(path));
+    }
+  }, [extraRoots, extraProbes]);
+  // Another main project: an extra folder that is now that project, inside it or of its repository leaves the task.
+  useEffect(() => {
+    setExtraRoots((cur) => {
+      const next = cur.filter((p) => !mainRef || (!samePath(p, mainRef.path) && !samePath(p, repoPath) && !extraBlock({ ...refOf(p), exists: true }, { main: mainRef, extras: [], windows: PLATFORM === "win" })));
+      return next.length === cur.length ? cur : next;
+    });
+  }, [mainRef, repoPath, refOf]);
+  const extrasMenu: LauncherExtras | null = extrasOk
+    ? {
+        paths: extraRoots,
+        detail: extraDetail,
+        blocked: (p) => {
+          const b = extraBlock({ path: p.path, name: p.name, gitRoot: extraProbes[p.path]?.git_root, exists: p.path_exists !== false }, { main: mainRef, extras: extraRoots.map(refOf), windows: PLATFORM === "win" });
+          return b ? blockText(b) : null;
+        },
+        onToggle: (path) => void toggleExtra(path),
+      }
+    : null;
+
   /** Whether the account an agent runs on is signed in, as the capability backend says (undefined: not known). */
   const accountSignedIn = useCallback(
     (agentId: string, accountId: string | null | undefined): boolean | undefined => capsOf(agentId, accountId)?.accounts.find((x) => x.id === accountId)?.signedIn,
@@ -993,7 +1108,7 @@ export function TaskLauncher({
   draftNow.current = () => {
     if (inline || forgetDraft.current || !choice) return;
     if (!isDraftWorthKeeping({ task, touched: userTouched.current || attachments.length > 0, expanded, branchEdited, checksEdited, restored })) return;
-    saveLauncherDraft({ task, choice, repoPath, branch, branchEdited, checks, checksEdited, expanded, viewMode, ...(attachments.length > 0 ? { attachments } : {}) });
+    saveLauncherDraft({ task, choice, repoPath, branch, branchEdited, checks, checksEdited, expanded, viewMode, ...(attachments.length > 0 ? { attachments } : {}), ...(extraRoots.length > 0 ? { extraRoots } : {}) });
   };
   useEffect(() => () => draftNow.current(), []);
 
@@ -1033,6 +1148,7 @@ export function TaskLauncher({
         result = await onLaunch({
           task: trimmed,
           repoRoot: root,
+          ...(activeExtras.length > 0 ? { extraRoots: activeExtras } : {}),
           agents: plannedAgents,
           track: effective.trackAsFeature ? "Full" : "Quick",
           doneWhen: checks.map((c) => c.trim()).filter(Boolean),
@@ -1093,7 +1209,7 @@ export function TaskLauncher({
       }
       onClose?.({ keepDraft: false });
     },
-    [canGo, effective, root, plannedAgents, modePrefs, task, onLaunch, checks, backend, presets, inline, onClose, defaultPresetName, focusTask, setBranchEdited, libPrompt, libPersona, attachments],
+    [canGo, effective, root, plannedAgents, modePrefs, task, onLaunch, checks, backend, presets, inline, onClose, defaultPresetName, focusTask, setBranchEdited, libPrompt, libPersona, attachments, activeExtras],
   );
 
   /**
@@ -1164,6 +1280,7 @@ export function TaskLauncher({
       const root = menuRef.current;
       if (!root) return;
       const target =
+        root.querySelector<HTMLElement>("[data-autofocus]") ??
         root.querySelector<HTMLElement>("[aria-pressed='true'], [aria-checked='true']") ??
         root.querySelector<HTMLElement>("button:not([disabled]):not([tabindex='-1']), input, [role='combobox']");
       target?.focus();
@@ -1175,6 +1292,17 @@ export function TaskLauncher({
     setMenu(null);
     if (m) requestAnimationFrame(() => chipRefs.current[m]?.focus());
   }, [menu]);
+  /** ⌘P / Ctrl+P: the project menu opens on its search (also when it is open already). */
+  const openProjectMenu = useCallback(() => {
+    setMenu("project");
+    setNewFolderOpen(false);
+    requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>("[data-autofocus]")?.focus());
+  }, []);
+  useEffect(() => {
+    // ⌘P reaches the app as a menu key too: with the launcher in front it opens the project menu.
+    window.addEventListener("hermes:launcher-project", openProjectMenu);
+    return () => window.removeEventListener("hermes:launcher-project", openProjectMenu);
+  }, [openProjectMenu]);
   /** A value picked in a menu: it closes and the task field has the keyboard (the next Enter launches). */
   const pickDone = useCallback(() => {
     setMenu(null);
@@ -1198,6 +1326,12 @@ export function TaskLauncher({
       e.preventDefault();
       e.stopPropagation();
       if (preset && Number(e.key) <= PRESET_SHORTCUTS) applyPreset(preset);
+      return;
+    }
+    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "p") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (choice) openProjectMenu();
       return;
     }
     if (mod && e.key === ".") {
@@ -1228,6 +1362,19 @@ export function TaskLauncher({
       e.preventDefault();
       e.stopPropagation();
       void launch(false);
+    }
+  };
+
+  /** Removes a project from the list (its files stay); the launcher's own project falls back to the starting one. */
+  const removeProject = async (project: ProjectOrdered) => {
+    await deleteProject(project.id);
+    const rest = projects.filter((p) => p.id !== project.id);
+    setProjects((prev) => prev.filter((p) => p.id !== project.id));
+    setExtraRoots((cur) => cur.filter((p) => !samePath(p, project.path)));
+    if (samePath(project.path, repoPathRef.current)) {
+      const next = startProject(rest)?.path ?? "";
+      repoPathRef.current = next;
+      setRepoPath(next);
     }
   };
 
@@ -1270,7 +1417,7 @@ export function TaskLauncher({
     controlRef.current = {
       launch: () => launch(false),
       keepAsDraft: () => {
-        if (choice) saveLauncherDraft({ task, choice, repoPath, branch, branchEdited, checks, checksEdited, expanded, viewMode, ...(attachments.length > 0 ? { attachments } : {}) });
+        if (choice) saveLauncherDraft({ task, choice, repoPath, branch, branchEdited, checks, checksEdited, expanded, viewMode, ...(attachments.length > 0 ? { attachments } : {}), ...(extraRoots.length > 0 ? { extraRoots } : {}) });
       },
     };
   }
@@ -1976,7 +2123,10 @@ export function TaskLauncher({
               onChange={(e) => update({ extraArgs: e.target.value })}
             />
           )}
-          {menuChip("project", repoPath.trim() ? baseName(repoPath) : t("launcher.projectNone"), { danger: !!repoPath.trim() && gitRoot === null && !plainFolder })}
+          {menuChip("project", repoPath.trim() ? `${baseName(repoPath)}${activeExtras.length > 0 ? ` +${activeExtras.length}` : ""}` : t("launcher.projectNone"), {
+            danger: !!repoPath.trim() && gitRoot === null && !plainFolder,
+            title: activeExtras.length > 0 ? [root ?? repoPath.trim(), ...activeExtras].join("\n") : undefined,
+          })}
           {!plainFolder && menuChip("where", whereChipText, { danger: unisolated })}
           {!isCustom &&
             menuChip("approval", approvalLabel(choice.agentId, choice.approvalModeId), {
@@ -2004,6 +2154,38 @@ export function TaskLauncher({
           >
             {expanded ? t("launcher.fewerOptions") : t("launcher.moreOptions", { shortcut: fmt("{mod}.") })}
           </Button>
+        </div>
+      )}
+
+      {choice && activeExtras.length > 0 && (
+        <div className="task-launcher-extras" role="group" aria-label={t("launcher.extrasAlso")}>
+          <span className="task-launcher-extras-label">{t("launcher.extrasAlso")}</span>
+          {activeExtras.map((path) => {
+            const detail = extraDetail(path);
+            return (
+              <Chip
+                key={path}
+                size="sm"
+                className="task-launcher-extra"
+                onRemove={() => {
+                  userTouched.current = true;
+                  setExtraRoots((cur) => cur.filter((p) => p !== path));
+                }}
+                removeLabel={t("launcher.extraRemove", { name: projectName(path) })}
+                title={path}
+                data-extra-path={path}
+              >
+                {projectName(path)}
+                {detail && <span className="task-launcher-extra-detail">{detail}</span>}
+              </Chip>
+            );
+          })}
+          <span className="task-launcher-muted">{t("launcher.extrasInPlace")}</span>
+          {choice.alsoOn && (
+            <span className="task-launcher-extras-shared" role="note">
+              {t("launcher.extrasShared")}
+            </span>
+          )}
         </div>
       )}
 
@@ -2072,81 +2254,81 @@ export function TaskLauncher({
             </>
           )}
           {menu === "project" && (
-            <>
-              <div className="task-launcher-menu-caption">{t("launcher.projectsCaption")}</div>
-              <div className="task-launcher-menu-items task-launcher-menu-column">
-                {projects.map((p) =>
-                  optionChip(
-                    p.path,
-                    samePath(p.path, repoPath),
-                    () => {
-                      setRepoPath(p.path);
+            <LauncherProjectMenu
+              projects={projects}
+              loadFailed={projectsFailed}
+              onRetry={() => setProjectsAttempt((n) => n + 1)}
+              isCurrent={(path) => samePath(path, repoPath)}
+              home={home}
+              onPick={(path) => {
+                setRepoPath(path);
+                // An extra folder made the main project is not an extra any more.
+                setExtraRoots((cur) => cur.filter((p) => !samePath(p, path)));
+                pickDone();
+              }}
+              onOpenFolder={() => void chooseFolder()}
+              onNewProject={() => setNewFolderOpen(true)}
+              onRemove={removeProject}
+              extras={extrasMenu}
+              newProject={
+                newFolderOpen ? (
+                  <NewFolderForm
+                    projects={projects}
+                    onCreated={(project) => {
+                      setProjects((prev) => [
+                        { ...project, session_count: 0, last_opened_at: null, path_exists: true },
+                        ...prev.filter((p) => !samePath(p.path, project.path)),
+                      ]);
+                      setNewFolderOpen(false);
+                      setRepoPath(project.path);
+                      // A new repository has no commit to make a worktree from:
+                      // its first task works in the folder itself.
+                      setWhere("current-checkout");
                       pickDone();
-                    },
-                    p.name,
-                    { "data-project-path": p.path, title: p.path },
-                    { note: p.path },
-                  ),
-                )}
-                <span className="task-launcher-folder-actions">
-                  <Button size="sm" className="task-launcher-browse" onClick={() => void chooseFolder()}>
-                    {t("launcher.browse")}
-                  </Button>
-                  <Button size="sm" className="task-launcher-new-folder" onClick={() => setNewFolderOpen(true)} disabled={newFolderOpen}>
-                    {t("newFolder.open")}
-                  </Button>
-                </span>
-              </div>
-              {newFolderOpen && (
-                <NewFolderForm
-                  projects={projects}
-                  onCreated={(project) => {
-                    setProjects((prev) => [{ path: project.path, name: project.name }, ...prev.filter((p) => !samePath(p.path, project.path))]);
-                    setNewFolderOpen(false);
-                    setRepoPath(project.path);
-                    // A new repository has no commit to make a worktree from:
-                    // its first task works in the folder itself.
-                    setWhere("current-checkout");
-                    pickDone();
-                  }}
-                  onCancel={() => setNewFolderOpen(false)}
-                />
-              )}
-              <label className="task-launcher-inline-label" htmlFor="task-launcher-repo">{t("launcher.repoTyped")}</label>
-              {/* Enter here confirms the folder (it never launches): the menu closes, the task field has the keyboard. */}
-              <span className="task-launcher-repo-field" data-own-enter="true">
-                <Input
-                  id="task-launcher-repo"
-                  code
-                  className="task-launcher-repo"
-                  value={repoPath}
-                  spellCheck={false}
-                  placeholder={t("launcher.repoPlaceholder")}
-                  aria-describedby={resolvedPath || (repoPath.trim() && gitRoot === null) ? "task-launcher-repo-state" : undefined}
-                  onChange={(e) => setRepoPath(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.nativeEvent.isComposing && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      pickDone();
-                    }
-                  }}
-                />
-              </span>
-              {(resolvedPath || (repoPath.trim() && gitRoot === null)) && (
-                <div id="task-launcher-repo-state" className="task-launcher-muted task-launcher-repo-state" role="status">
-                  {resolvedPath ? t("launcher.repoResolved", { path: resolvedPath }) : null}
-                  {resolvedPath && gitRoot === null ? " · " : null}
-                  {gitRoot === null
-                    ? folder && !folder.exists
-                      ? t("launcher.block.noFolder")
-                      : folder && !folder.isDir
-                        ? t("launcher.block.notAFolder")
-                        : t("folder.notGitHint")
-                    : null}
+                    }}
+                    onCancel={() => setNewFolderOpen(false)}
+                  />
+                ) : null
+              }
+              typedPath={
+                <div className="task-launcher-typed-path">
+                  <label className="task-launcher-inline-label" htmlFor="task-launcher-repo">{t("launcher.repoTyped")}</label>
+                  {/* Enter here confirms the folder (it never launches): the menu closes, the task field has the keyboard. */}
+                  <span className="task-launcher-repo-field" data-own-enter="true">
+                    <Input
+                      id="task-launcher-repo"
+                      code
+                      className="task-launcher-repo"
+                      value={repoPath}
+                      spellCheck={false}
+                      placeholder={t("launcher.repoPlaceholder")}
+                      aria-describedby={resolvedPath || (repoPath.trim() && gitRoot === null) ? "task-launcher-repo-state" : undefined}
+                      onChange={(e) => setRepoPath(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.nativeEvent.isComposing && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          pickDone();
+                        }
+                      }}
+                    />
+                  </span>
+                  {(resolvedPath || (repoPath.trim() && gitRoot === null)) && (
+                    <div id="task-launcher-repo-state" className="task-launcher-muted task-launcher-repo-state" role="status">
+                      {resolvedPath ? t("launcher.repoResolved", { path: resolvedPath }) : null}
+                      {resolvedPath && gitRoot === null ? " · " : null}
+                      {gitRoot === null
+                        ? folder && !folder.exists
+                          ? t("launcher.block.noFolder")
+                          : folder && !folder.isDir
+                            ? t("launcher.block.notAFolder")
+                            : t("folder.notGitHint")
+                        : null}
+                    </div>
+                  )}
                 </div>
-              )}
-            </>
+              }
+            />
           )}
           {menu === "where" && !plainFolder && whereBlock}
           {menu === "approval" && approvalBlock}

@@ -261,20 +261,20 @@ features:
         text: "The fake agent approval scenario changes the session status in the real app on all three OSes"
         scenarios: [N03-fake-agent.mjs]
   F04:
-    name: "Private by default"
+    name: "Analytics on by default, opt-out respected"
     # partial: the scenario proves no analytics traffic while off; a full
     # 10-minute network capture is not automated.
     status: partial
     criteria:
       F04-1:
-        text: "A fresh profile has telemetry_enabled=false"
-        scenarios: [F04-private-by-default.mjs]
+        text: "A fresh profile has no stored telemetry_enabled and sends anonymous analytics; turning it off stores telemetry_enabled=false"
+        scenarios: [F04-analytics-opt-out.mjs]
       F04-2:
-        text: "With telemetry off, a network capture during a 10-minute session shows only update-check traffic"
-        scenarios: [F04-private-by-default.mjs]
+        text: "With telemetry off, a network capture during a 10-minute session shows only update-check traffic, also after a relaunch"
+        scenarios: [F04-analytics-opt-out.mjs]
       F04-3:
         text: "Delete session data removes Hermes caches for the chosen session and leaves the repo intact"
-        scenarios: [F04-private-by-default.mjs]
+        scenarios: [F04-analytics-opt-out.mjs]
   F02:
     name: "Crash containment and startup diet"
     status: partial
@@ -1473,7 +1473,7 @@ features:
         text: "The doctor shows the version and auth state for Claude, Codex and OpenCode when installed"
         scenarios: [F16-onboarding-doctor.mjs]
       F16-4:
-        text: "The usage stats line reads 'off'"
+        text: "The usage stats line reads 'on' and says how to turn it off"
         scenarios: [F16-onboarding-doctor.mjs]
   N19:
     name: "Rate limits and handoff"
@@ -1552,6 +1552,10 @@ features:
         # e2e/app/scenarios/REAL-launcher-attachments.mjs, local only like the others.
         text: "From ⌘N with a pasted image and a dropped text file, the real claude gets both paths after the task and answers with the image's color and the file's code word"
         scenarios: ["REAL-launcher-attachments.mjs@darwin,linux"]
+      REAL-4c:
+        # e2e/app/scenarios/REAL-launcher-extra-folder.mjs, local only like the others.
+        text: "From ⌘N with a project added as an extra folder (chip main +1, the Also line names it), the real claude runs with exactly one --add-dir of that folder, none for the main project or its worktree, and replies with a token read from a file in it"
+        scenarios: ["REAL-launcher-extra-folder.mjs@darwin,linux"]
       REAL-5:
         # e2e/app/scenarios/REAL-track-claude.mjs, local only like the others.
         text: "Track as a feature with the real claude (haiku): it writes questions.md, runs hi phase done and stops with the code untouched; approving moves it to research and it starts research"
@@ -1889,6 +1893,9 @@ features:
       QA-launcher-15:
         text: "New folder… in ⌘N and the New Session wizard makes a new project folder, like an IDE's New Project: a name, where it goes, and a git repository, .gitignore, AGENTS.md (with CLAUDE.md importing it) and README as chosen; an existing folder is refused and left untouched; the agent starts in the new folder"
         scenarios: [QA-launcher-new-project-folder.mjs]
+      QA-launcher-16:
+        text: "A task can take extra folders besides its project: a checkbox in ⌘N's project menu adds one, the project chip says +1, and the agent starts in the project's task checkout with both projects attached and the extra folder as an --add-dir, which gets no worktree"
+        scenarios: [QA-launcher-extra-folder.mjs]
   REAL-HOD:
     name: "The prompt library with the real Claude Code and Codex CLIs"
     # Local only, like REAL above: needs the signed-in CLIs and costs a tiny
