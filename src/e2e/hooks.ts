@@ -99,6 +99,12 @@ const hooks = {
    * account exactly as the launcher does (create_session with agentLaunch,
    * through the helper), and show it. Returns the new session's id.
    */
+  /** Split the focused pane and show a session in the new pane ("horizontal": side by side). */
+  splitWith: (sessionId: string, direction: "horizontal" | "vertical"): void => {
+    const bridge = getE2ESessionBridge();
+    if (!bridge) throw new Error("the session provider has not registered its e2e bridge");
+    bridge.split(sessionId, direction);
+  },
   launchWithChoice: async (opts: {
     agentId: string;
     task?: string;
@@ -201,6 +207,11 @@ const hooks = {
       webgl: entry.webgl !== null,
       /** Canvases the terminal's renderer put on its screen (WebGL only). */
       canvases: entry.container.querySelectorAll(".xterm-screen canvas").length,
+      /** First buffer row shown, and first row of the last page (equal at the bottom). */
+      viewportY: entry.terminal.buffer.active.viewportY,
+      baseY: entry.terminal.buffer.active.baseY,
+      /** Hermes's own idea of whether the person scrolled up. */
+      scrolledUp: entry.userScrolledUp,
     };
   },
   /** Write straight to a terminal's screen, as if a program printed it

@@ -307,8 +307,6 @@ pub struct OutputAnalyzer {
     files_touched: HashSet<String>,
     files_ordered: VecDeque<String>,
     // Actions
-    recent_actions: VecDeque<ActionEvent>,
-    available_actions: Vec<ActionTemplate>,
     // Memory
     memory_facts: VecDeque<MemoryFact>,
     memory_keys_seen: HashSet<String>,
@@ -544,8 +542,6 @@ impl OutputAnalyzer {
             tool_call_summary: HashMap::new(),
             files_touched: HashSet::new(),
             files_ordered: VecDeque::new(),
-            recent_actions: VecDeque::new(),
-            available_actions: Vec::new(),
             memory_facts: VecDeque::new(),
             memory_keys_seen: HashSet::new(),
             last_input_at: None,
@@ -733,14 +729,15 @@ impl OutputAnalyzer {
                 if let Some((idx, agent)) = self.registry.detect_agent(trimmed) {
                     self.active_provider_idx = Some(idx);
                     self.detected_agent = Some(agent);
-                    self.available_actions = self.registry.adapters[idx].known_actions();
                 }
             }
             // Keep trying to extract model name if we have agent but model is unknown
             // (e.g. Claude Code shows model on a separate line from the version)
             // Also detect model changes (e.g. "/model" command output)
             if let Some(ref mut agent) = self.detected_agent {
-                if let Some(model) = extract_model_name(trimmed) {
+                if let Some(model) =
+                    extract_model_name(trimmed).filter(|m| model_fits_provider(&agent.provider, m))
+                {
                     let lower = trimmed.to_lowercase();
                     let is_model_change = lower.contains("set model to")
                         || lower.contains("model:")
@@ -832,12 +829,6 @@ impl OutputAnalyzer {
             self.tool_calls.push_back(tc);
             if self.tool_calls.len() > 100 {
                 self.tool_calls.pop_front();
-            }
-        }
-        if let Some(action) = analysis.action {
-            self.recent_actions.push_back(action);
-            if self.recent_actions.len() > 20 {
-                self.recent_actions.pop_front();
             }
         }
         if let Some(fact) = analysis.memory_fact {
@@ -1037,8 +1028,6 @@ impl OutputAnalyzer {
             tool_call_summary: self.tool_call_summary.clone(),
             files_touched: self.files_ordered.iter().cloned().collect(),
             recent_errors: vec![],
-            recent_actions: self.recent_actions.iter().cloned().collect(),
-            available_actions: self.available_actions.clone(),
             memory_facts: self.memory_facts.iter().cloned().collect(),
             latency_p50_ms: percentile(&self.latency_samples, 50.0),
             latency_p95_ms: percentile(&self.latency_samples, 95.0),
@@ -1231,6 +1220,22 @@ mod tests {
         save(&mut restored);
         save(&mut restored);
         assert_eq!(saved_usage(&db), (1, 220, 29, 1.5));
+    }
+
+    #[test]
+    fn a_claude_session_keeps_its_model_when_the_agent_talks_about_gemini() {
+        let mut a = OutputAnalyzer::new();
+        a.process(b"Claude Code v2.1.287\r\nOpus 4.7 with high effort\r\n");
+        let model = |a: &OutputAnalyzer| a.detected_agent.as_ref().and_then(|d| d.model.clone());
+        assert_eq!(model(&a).as_deref(), Some("opus"));
+        // The agent's own answer names other vendors' models.
+        a.process(b"Model: Gemini 4 Argon is out; the prompt library needs a price for it\r\n");
+        a.process(b"Claude Code can't run gemini-3-pro, switching to the docs\r\n");
+        a.process(b"Set model to gpt-5\r\n");
+        assert_eq!(model(&a).as_deref(), Some("opus"));
+        // Its own /model switch still counts.
+        a.process(b"Set model to Sonnet 4.5\r\n");
+        assert_eq!(model(&a).as_deref(), Some("sonnet"));
     }
 
     #[test]
